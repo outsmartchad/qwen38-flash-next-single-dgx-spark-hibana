@@ -10,7 +10,9 @@ from pathlib import Path
 from benchmark import BASE_URL, CURL, MODEL, api, stream
 
 REGIONS = ("cedar", "bay", "canyon", "delta", "field", "grove", "hill", "lake")
-SEED = 2026112032
+SEED = 2026112132
+TARGETS = (32768, 131072)
+REPETITIONS = 3
 
 
 def long_prompt(seed, rows):
@@ -32,8 +34,8 @@ def token_count(prompt):
     return api("/v1/tokenize", {"prompt": prompt}, timeout=30)["count"]
 
 
-def prefill(target):
-    seed = SEED + target
+def prefill(target, repetition):
+    seed = SEED + target + repetition * 1_000_000
     calibration, _ = long_prompt(seed, 64)
     count = round(target * 64 / token_count(calibration))
     for _ in range(5):
@@ -52,6 +54,7 @@ def prefill(target):
     if abs(row["prompt_tokens"] - target) > target * 0.005:
         raise RuntimeError(f"Prompt count after chat formatting did not reach {target}")
     row.update(target_prompt_tokens=target, tokenized_raw_prompt_tokens=text_tokens,
+               repetition=repetition, prompt_seed=seed,
                exact_key_found=answer.strip() == marker, expected_key=marker,
                returned_answer=answer.strip(),
                prompt_tokens_per_second_to_first_token=row["prompt_tokens"] / row["first_token_seconds"])
@@ -63,24 +66,32 @@ def main():
     parser.add_argument("output", type=Path)
     output = parser.parse_args().output
     output.parent.mkdir(parents=True, exist_ok=True)
-    targets = [32768, 200000]
+    warmups = [measure(target, 0) for target in TARGETS]
     rows = []
-    for target in targets:
-        print(f"Starting fresh prompt near {target:,} tokens", file=sys.stderr, flush=True)
-        row = prefill(target)
-        rows.append(row)
-        print(f"{row['prompt_tokens']:,} input tokens, "
-              f"{row['prompt_tokens_per_second_to_first_token']:.0f} tok/s, "
-              f"TTFT {row['first_token_seconds']:.2f}s, "
-              f"retrieval {'passed' if row['exact_key_found'] else 'failed'}",
-              file=sys.stderr, flush=True)
-        save(rows, output)
+    for repetition in range(1, REPETITIONS + 1):
+        order = TARGETS if repetition % 2 else TARGETS[::-1]
+        for target in order:
+            rows.append(measure(target, repetition))
+            save(rows, warmups, output)
 
 
-def save(rows, destination):
+def measure(target, repetition):
+    phase = f"Sample {repetition}/{REPETITIONS}" if repetition else "Warm-up"
+    print(f"{phase}: fresh prompt near {target:,} tokens", file=sys.stderr, flush=True)
+    row = prefill(target, repetition)
+    print(f"{row['prompt_tokens']:,} input tokens, "
+          f"{row['prompt_tokens_per_second_to_first_token']:.0f} tok/s, "
+          f"TTFT {row['first_token_seconds']:.2f}s, "
+          f"retrieval {'passed' if row['exact_key_found'] else 'failed'}",
+          file=sys.stderr, flush=True)
+    return row
+
+
+def save(rows, warmups, destination):
     payload = {"model": MODEL, "profile": "hibana-fast", "seed": SEED,
                "thinking": False, "temperature": 0, "metric": "prompt_tokens / TTFT",
-               "prompts": rows}
+               "target_prompt_tokens": list(TARGETS), "samples_per_target": REPETITIONS,
+               "warmups": warmups, "prompts": rows}
     temp = destination.with_suffix(".tmp")
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     temp.replace(destination)

@@ -32,12 +32,12 @@ For KV format, read `config.kv_format` in the raw Hibana runtime record. The top
 With only the dedicated Hibana benchmark server running and the URL and model variables from the README exported, run:
 
 ```bash
-python3 bin/prefill.py runs/fast.prefill.json
+python3 bin/prefill.py runs/fast.prefill-32k-128k.json
 ```
 
-The script sizes two synthetic inventory prompts with Hibana's tokenizer, flushes the server's prefix cache before each generation, and validates the prompt-token counts and cache status from streamed usage. It measures 32K first and 200K second, once each. Rate is client-observed prompt tokens divided by time to first token. TTFT includes request handling, prefill, any first-use overhead, and initial decode. Interpret the two sizes as observations from that sequence.
+The script targets 32,768 and 131,072 input tokens using synthetic inventory prompts. It warms up once at each size, then alternates which size runs first over three rounds. Each sample uses fresh prompt content, flushes the server's prefix cache, and validates zero cached tokens from streamed usage. Rate is the actual prompt tokens divided by client time to first token. TTFT includes request handling, prefill, and first-token generation. The table reports median tok/s and median TTFT across the three samples at each size.
 
-For memory, the Spark ran `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits -lms 200` from before launch through decode and prefill. We filtered the samples using the container's host PID. The published peak is the maximum per-process GPU memory sample, converted from MiB to GiB. The recorded series includes startup and workload samples.
+For the earlier 32K/200K run, the Spark ran `nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits -lms 200` from before launch through decode and prefill. We filtered the samples using the container's host PID. The published peak is the maximum per-process GPU memory sample, converted from MiB to GiB. The recorded series includes startup and workload samples.
 
 ### Raw artifacts
 
@@ -45,4 +45,5 @@ For memory, the Spark ran `nvidia-smi --query-compute-apps=pid,used_memory --for
 - Hibana exact · [Decode](../results/exact.decode.json) · [Chinese and tool calls](../results/exact.checks.json) · [Runtime settings](../results/exact.server.json)
 - Hibana fast · [Decode](../results/fast.decode.json) · [Chinese and tool calls](../results/fast.checks.json) · [Runtime settings](../results/fast.server.json)
 - [Base revision](../results/target.json) · [W3 revision](../results/w3.json) · [Image digest](../results/hibana.image.txt)
-- [Cold prefill](../results/fast.prefill.json) · [Per-process memory samples](../results/fast.memory.json) · [Decode sweep used for memory sampling](../results/fast.decode-memory-workload.json)
+- [32K/128K cold prefill and warm-ups](../results/fast.prefill-32k-128k.json)
+- [Earlier 32K/200K run](../results/fast.prefill.json) · [Per-process memory samples](../results/fast.memory.json) · [Decode sweep used for memory sampling](../results/fast.decode-memory-workload.json)
