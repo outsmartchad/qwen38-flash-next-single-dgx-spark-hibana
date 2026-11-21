@@ -1,6 +1,6 @@
 # Qwen3.8 Flash Next on one DGX Spark with Hibana
 
-**101.7 tok/s single-stream prose decode** with Hibana `fast` and thinking on. The same Spark reached **220.9 tok/s aggregate at four streams** and **213.8 tok/s at five**. This recipe reproduces the serving configuration for both Hibana profiles and includes the matched TensorFold control, Traditional Chinese prompts, and OpenAI tool-call checks.
+Single-stream prose decode with thinking on reached **101.7 tok/s** with Hibana `fast` and **56.0 tok/s** in the published TensorFold run. Hibana `fast` reached **220.9 tok/s aggregate at four streams** and **213.8 tok/s at five**. This recipe reproduces the serving configuration for both Hibana profiles and includes the matched TensorFold control, Traditional Chinese prompts, and OpenAI tool-call checks.
 
 ![Qwen3.8 Flash Next on Hibana fast. Decode 101.7 tok/s at one stream and 213.8 at five. Cold prefill 3,796 tok/s at 32K and 3,536 at 128K. Peak sampled GPU memory 101.2 GiB.](assets/hibana-fast-101-7.png)
 
@@ -8,7 +8,7 @@
 
 Measured on November 21, 2026. All requests ran directly against the loopback API on the Spark. The test used the SparkDash hash-map prose prompt, thinking on, temperature 0.7, top-p 1, top-k 20, and 400 output tokens per request. Each row uses the fastest aggregate of three waves. TTFT is the median in that same wave.
 
-| Streams | TensorFold tok/s | TTFT | Hibana exact tok/s | TTFT | Hibana fast tok/s | TTFT |
+| Streams | TensorFold same-session control (tok/s) | TTFT | Hibana exact tok/s | TTFT | Hibana fast tok/s | TTFT |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 44.5 | 63 ms | 50.8 | 87 ms | 101.7 | 67 ms |
 | 2 | 76.4 | 93 ms | 73.8 | 112 ms | 147.3 | 522 ms |
@@ -16,7 +16,7 @@ Measured on November 21, 2026. All requests ran directly against the loopback AP
 | 4 | 108.9 | 152 ms | 104.8 | 787 ms | 220.9 | 124 ms |
 | 5 | 111.4 | 186 ms | 116.6 | 228 ms | 213.8 | 403 ms |
 
-The previous TensorFold run reached **56.0 tok/s at one stream** and **125.6 tok/s at five**. The table includes the fresh control from the same session as Hibana. Hibana uses the pinned RadixArk checkpoint, and the TensorFold recipe uses NVIDIA's NVFP4 checkpoint. This is a comparison of complete serving configurations. [Published TensorFold benchmark](https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-tensorfold#decode-prose-thinking-on)
+The TensorFold control from the Hibana benchmark session reached **44.5 tok/s at one stream** and **111.4 tok/s at five**. The earlier published TensorFold run reached **125.6 tok/s at five streams**. Hibana uses the pinned RadixArk checkpoint, and the TensorFold recipe uses NVIDIA's NVFP4 checkpoint. This is a comparison of complete serving configurations. [Published TensorFold benchmark](https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-tensorfold#decode-prose-thinking-on)
 
 [Method, per-request decode rates and raw results](docs/benchmarking.md)
 
