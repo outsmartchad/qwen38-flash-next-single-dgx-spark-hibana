@@ -2,7 +2,7 @@
 
 **101.7 tok/s single-stream prose decode** with Hibana `fast` and thinking on. The same Spark reached **220.9 tok/s aggregate at four streams** and **213.8 tok/s at five**. This recipe reproduces the serving configuration for both Hibana profiles and includes the matched TensorFold control, Traditional Chinese prompts, and OpenAI tool-call checks.
 
-![Benchmark card for Qwen3.8 Flash Next on a single DGX Spark with Hibana fast. 101.7 tok/s at one stream, 220.9 at four, and 213.8 at five.](assets/hibana-fast-101-7.png)
+![Qwen3.8 Flash Next on Hibana fast. Decode 101.7 tok/s at one stream and 213.8 at five. Cold prefill 1,740 tok/s at 32K and 3,367 at 200K. Peak sampled GPU memory 101.2 GiB.](assets/hibana-fast-101-7.png)
 
 ## Performance on one DGX Spark
 
@@ -19,6 +19,19 @@ Measured on November 21, 2026. All requests ran directly against the loopback AP
 The previous TensorFold run reached **56.0 tok/s at one stream** and **125.6 tok/s at five**. The table includes the fresh control from the same session as Hibana. Hibana uses the pinned RadixArk checkpoint, and the TensorFold recipe uses NVIDIA's NVFP4 checkpoint. This is a comparison of complete serving configurations. [Published TensorFold benchmark](https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-tensorfold#decode-prose-thinking-on)
 
 [Method, per-request decode rates and raw results](docs/benchmarking.md)
+
+## Cold prefill and peak memory
+
+A second `fast` run measured two fresh prompts with thinking off and temperature zero. The rate is prompt tokens divided by client TTFT. Both prompts reported zero cached tokens and returned the expected audit code.
+
+| Prompt tokens | Prefill tok/s to first token | TTFT | Retrieved audit code |
+|---:|---:|---:|:---|
+| 32,794 | 1,740 | 18.85 s | Yes |
+| 199,981 | 3,367 | 59.40 s | Yes |
+
+Peak sampled memory for the Hibana GPU process was **101.2 GiB**. Sampling covered startup, the 1–5 stream decode sweep, and both prefill requests. The card keeps the decode values from the matched comparison above.
+
+[Cold prefill results](results/fast.prefill.json) · [Memory samples](results/fast.memory.json) · [Decode workload from the memory run](results/fast.decode-memory-workload.json)
 
 ## Exact and fast
 
