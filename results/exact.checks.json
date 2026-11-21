@@ -1,0 +1,110 @@
+{
+  "model": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+  "chinese": [
+    {
+      "name": "volume",
+      "passed": true,
+      "expected": "1.00",
+      "actual": "1.00"
+    },
+    {
+      "name": "time",
+      "passed": true,
+      "expected": "15:25",
+      "actual": "15:25"
+    },
+    {
+      "name": "extraction",
+      "passed": true,
+      "expected": "HK-027",
+      "actual": "HK-027"
+    },
+    {
+      "name": "traditional",
+      "passed": true,
+      "expected": "這個資料庫已經恢復正常",
+      "actual": "這個資料庫已經恢復正常"
+    },
+    {
+      "name": "selection",
+      "passed": true,
+      "expected": "乙倉",
+      "actual": "乙倉"
+    }
+  ],
+  "tools": [
+    {
+      "name": "inventory_en",
+      "passed": true,
+      "expected_tool": "lookup_inventory",
+      "expected_args": {
+        "sku": "SPARK-42",
+        "warehouse": "Kowloon",
+        "include_reserved": false
+      },
+      "actual_tool": "lookup_inventory",
+      "actual_args": {
+        "sku": "SPARK-42",
+        "warehouse": "Kowloon",
+        "include_reserved": false
+      },
+      "finish_reason": "tool_calls",
+      "call_count": 1,
+      "string_args": true
+    },
+    {
+      "name": "inventory_zh",
+      "passed": true,
+      "expected_tool": "lookup_inventory",
+      "expected_args": {
+        "sku": "TAI-12",
+        "warehouse": "Sha Tin",
+        "include_reserved": true
+      },
+      "actual_tool": "lookup_inventory",
+      "actual_args": {
+        "include_reserved": true,
+        "sku": "TAI-12",
+        "warehouse": "Sha Tin"
+      },
+      "finish_reason": "tool_calls",
+      "call_count": 1,
+      "string_args": true
+    },
+    {
+      "name": "typed_array",
+      "passed": false,
+      "expected_tool": "compare_warehouses",
+      "expected_args": {
+        "warehouses": [
+          "Kowloon",
+          "Sha Tin"
+        ],
+        "limit": 3,
+        "tags": [
+          "cold",
+          "priority"
+        ]
+      },
+      "actual_tool": "compare_warehouses",
+      "actual_args": {
+        "limit": 3,
+        "tags": "[\"cold\", \"priority\"]",
+        "warehouses": [
+          "Kowloon",
+          "Sha Tin"
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "call_count": 1,
+      "string_args": true
+    },
+    {
+      "name": "follow_up",
+      "passed": true,
+      "actual": "23",
+      "expected": "23",
+      "extra_calls": 0
+    }
+  ]
+}
