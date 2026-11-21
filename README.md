@@ -61,6 +61,26 @@ The quality probes used temperature zero and thinking off. Tool calls used ficti
 
 [TensorFold probe output](results/tensorfold.checks.json) · [Exact probe output](results/exact.checks.json) · [Fast probe output](results/fast.checks.json)
 
+## Multi-file coding benchmark
+
+Measured on November 21, 2026 on one DGX Spark. Each profile started from the same [recipe checkout](https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-tensorfold/commit/88fded2f17ca32c727d1220952fb6594ea0b8590). The task was to add a `--thinking` flag to the benchmark CLI, track first-token and first-answer times separately, and update the tests and docs. The untouched checkout passed 13 repository tests and failed all 10 checks for the new feature.
+
+All three ran sequentially on loopback with thinking on, temperature zero and the same Python tool harness. Each had **32,768 total generated tokens** and up to **30 model turns**. A response could use the full remaining budget. Coding time includes model responses, tools and in-loop tests. Coding time excludes model startup and post-run grading.
+
+| Serving profile | Coding time | Tokens used | Repo suite | Independent feature checks | End state |
+|---|---:|---:|---:|---:|---|
+| TensorFold 1.2.7 | 6m 19s | 22,331 | 13/13 | 9/10 | 30-turn limit |
+| Hibana `exact` | 10m 12s | 32,768 | 13/13 | 10/10 | Token budget exhausted |
+| Hibana `fast` | 4m 31s | 32,768 | 13/13 | 7/10 | Token budget exhausted |
+
+- **TensorFold** updated the CLI, tests and docs. It reached the 30-turn limit with 10,437 tokens available. The remaining feature failure was the timestamp when answer text precedes reasoning.
+- **Hibana `exact`** passed all 10 independent checks and its edited repository suite. It exhausted the budget with the documentation update still pending.
+- **Hibana `fast`** ended sooner and passed seven independent checks. Its patch still lacked the CLI switch and failed the answer-before-reasoning timing case.
+
+The untouched 13-test suite was also replayed against each patch. TensorFold passed 12, Hibana `exact` passed 11, and Hibana `fast` passed 13. The failures were mock callbacks that rejected the new `thinking` keyword.
+
+The preceding 16,384-token run used the same harness without a per-response cap. All three exhausted that budget. The 32,768-token rerun is one attempt per serving profile on this task.
+
 ## Run it
 
 Use a DGX Spark with Docker, NVIDIA GPU container support, Git, Bash, curl, and Python 3. This run used NVIDIA driver `580.178.04`. Checkpoint downloads total about **126 GiB** for `exact`, plus **47 GiB** for `fast`. Allow additional space for the image and CUDA kernel caches.
