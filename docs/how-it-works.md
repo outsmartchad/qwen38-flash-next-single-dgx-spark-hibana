@@ -1,87 +1,123 @@
-# How Qwen3.8 Flash Next and Hibana work
+# How Qwen3.8 Flash Next and Hibana work on one DGX Spark
 
 [Setup](setup.md) · [Troubleshooting](troubleshooting.md) · [Measurement method and raw results](benchmarking.md)
 
 ## How the model works
 
-Flash Next combines a sparsely activated language backbone with an unusually large lookup table. That makes it an interesting single-Spark target. The router limits the feed-forward work done for each token, and the runtime can serve lookup rows from host memory as needed. The original model also has a vision encoder. Both Hibana runs in this recipe used the text path. [Qwen model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#model-overview) · [Qwen technical report](https://arxiv.org/html/2608.30320v1#S2) · [Exact runtime record](../results/exact.server.json) · [Fast runtime record](../results/fast.server.json)
+How can a model with a 51-billion-parameter lookup table run on a Spark with 128 GB of shared physical memory? The answer starts with what the model reads for one token. It looks up a handful of rows in that table, chooses a small fraction of its feed-forward experts and carries two different kinds of context through its layers. Hibana exploits all three properties. Qwen counts **125B parameters in the language backbone, about 6B active per token, plus 51B in n-gram embeddings and 4B in a multi-token prediction module**. The release also contains a vision encoder. Hibana's pinned Flash Next implementation loads the text path. [Qwen model card][card] · [Architecture report][report] · [Hibana model as served][engine]
 
-### Parameters and token flow
+### From chat text to four streams of numbers
 
-Qwen reports a 125B language backbone with about 6B parameters active per token, **plus** 51B parameters in n-gram embeddings and 4B in a one-layer MTP module. The main stack has 48 layers of width 2,560. Each mixture-of-experts (MoE) block routes a token to 10 of 512 learned feed-forward experts and also runs a shared expert. A token therefore makes 480 routed expert selections across the main stack. Those are selections over layers, so the same expert index in two layers points to different weights. The runtime needs access to the full expert bank because different tokens select different subsets. [Model specifications](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#model-overview) · [Pinned RadixArk model config](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/blob/7b719225242aacd3dbd3f9407468c2ee9a9d2594/config.json)
+Suppose you send “The audit code on shelf seven is LIME. What is the audit code?” A chat template adds role markers and an assistant-turn boundary. The tokenizer converts that sequence into integer IDs. A **token** can be a word fragment, punctuation, whitespace or a control marker. The number of tokens used for “LIME” depends on the tokenizer and surrounding text. Every ID selects a row from a padded vocabulary of 248,320 rows. That row is an **embedding**, a vector of 2,560 numbers that provides the starting representation for its position. The conversation's **context** is the ordered sequence available to the model, including template markers and the tokens it has already generated. [Model dimensions][card] · [Pinned checkpoint config][cfg]
+
+The embedding table and projection matrices contain **weights** learned during training. The sequence of numbers computed for this shelf and this question are **activations**. Training can change a weight when the model predicts a continuation poorly. Serving this request leaves the weights fixed and creates activations and temporary memory for its individual context. An identical token starts with the same embedding at both occurrences. Its later representation may describe the code on the shelf in the first sentence and a request for that code in the second. [Qwen training and architecture][report]
 
 ```text
-Chat template → token IDs → token embeddings
-                               ↓
-             early n-gram lookup and gated feature injection
-                               ↓
-      12 groups of [GDN → MoE] ×3, then [QSA → MoE]
-              carried by a four-branch residual stream
-                               ↓
-        output head → next-token logits → selected token
-                               └─ hidden state also feeds the MTP proposer
+IDs → 2,560-wide embeddings → copy into four residual streams
+       group 1   GDN + MoE → GDN + MoE → GDN + MoE → QSA + MoE
+                             ↑ n-gram features enter before layer 2
+       groups 2–12 repeat the four-layer sequence
+       all layers read from and write to the four streams
+       final gated mixer → output head → vocabulary scores → next ID
+       last hidden streams + recent token → one-layer MTP proposer
 ```
 
-This diagram shows the text model's data flow. The n-gram lookup happens inside the early stack, and the residual branches carry layer inputs and outputs around the attention and MoE sublayers. [Qwen architecture and ablations](https://arxiv.org/html/2608.30320v1#S2) · [Pinned Hibana model implementation](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#the-model-as-served)
+A conventional residual connection adds a layer's update to its input so earlier features can travel through a deep network. Flash Next widens this route to four branches of width 2,560. At the entrance they contain copies of the same embedding. Before a sublayer, the model normalizes each branch. A small network with a 320-dimensional bottleneck produces a gate for each feature on each branch. The gated vectors combine into one input for the expensive sublayer. Separate scalar gates control how strongly its output is added back to each branch. Now the branches can differ. The model makes these read and write decisions again for the next sublayer. The expert runs once on the combined input, and the model retains four channels of features for the next layer. [Qwen's Gated Residual design](https://arxiv.org/html/2608.30320v1#S2.SS2) · [Pinned Hibana mixer][mixer]
 
-### Recurrent state and sparse attention
+### What the large table remembers
 
-- **Gated DeltaNet (GDN)** handles 36 of the 48 layers. It updates a fixed-size state per sequence. A learned gate controls how much old state survives, and a delta update corrects what that state associates with the new key. Decode can update this state incrementally, and chunkwise implementations process a prefill block in parallel. [Gated Delta Networks](https://arxiv.org/abs/2412.06464) · [Qwen's GDN design](https://arxiv.org/html/2608.30320v1#S2.SS1.SSS1)
-- **Qwen Sparse Attention (QSA)** handles the other 12 layers. A lightweight indexer scores four-token micro-blocks of the retained context. The long-context path selects up to 512 completed blocks, representing 2,048 positions, and also considers the current partial block. The selected blocks can come from earlier parts of the conversation. The server still stores past keys and values for future selection. [Qwen's QSA design](https://arxiv.org/html/2608.30320v1#S2.SS1.SSS2) · [Hibana sparse attention path](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#sparse-attention-past-2048-tokens)
-- **Gated Residual** widens the residual stream to four branches with learned, input-dependent reads and per-branch writes. The n-gram table adds another source of features. Recent token IDs form hashed bigram and trigram indices, and a gate injects the returned features into an early layer. The size of this learned table increases storage capacity while each token reads only its selected rows. [Gated Residual and n-gram embeddings](https://arxiv.org/html/2608.30320v1#S2)
+A bigram is a pair of consecutive token IDs, and a trigram is a run of three. At the second decoder layer, the prefix-lookup embedding module hashes the current pair and triple. Eight lookup heads for each order select **16 rows per token** from the table. The rows hold learned feature vectors. A projection, a gate informed by the current hidden representation, and a causal convolution inject features into the residual streams. This gives a recurring short sequence a learned representation beyond the ordinary embedding of its final token. Only earlier and current IDs participate. The model can therefore compute the lookup addresses from prompt IDs before all the intervening layers have finished. [Qwen's n-gram design](https://arxiv.org/html/2608.30320v1#S2.SS3) · [Pinned lookup and convolution][ple]
 
-### Why an MTP head helps decode
+The table is shared across conversations and stays fixed during a chat. The invented fact “shelf seven is LIME” has to travel through the request's sequence memory. A frequently encountered fragment within that sentence might pick up a useful pretrained feature through a lookup. The numerical associations learned during training remain in the table when the conversation ends. These different lifetimes explain why the checkpoint table can live in mapped files while each conversation needs its own recurrent state and attention history. [Lookup implementation][ple] · [Cache design][cache]
 
-Autoregressive decode makes each new token depend on the preceding tokens. Flash Next's multi-token prediction (MTP) module uses the recent hidden state to propose upcoming tokens at lower cost than running the entire model for each proposal. The target then evaluates a block of proposals together. When a draft agrees with the verification rule, the engine can commit several tokens from one target pass. Rejected proposals require a target token and state correction. The speedup depends on the accepted length, propose and verify cost, and request batch. [Qwen model card](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#model-overview) · [Multi-token prediction research](https://arxiv.org/abs/2404.19737) · [Speculative decoding algorithm](https://arxiv.org/abs/2211.17192) · [Hibana's MTP path](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#the-mtp-draft)
+### Two ways to connect the question to its answer
+
+**Gated DeltaNet (GDN)** occupies 36 of the 48 layers. Think of a head's recurrent state as a matrix that associates keys with values. Learned projections and a short causal convolution give a new position query, key and value features. A decay gate controls how much earlier state survives. The layer compares what the decayed state predicts for this key with its incoming value and writes a gated fraction of the difference. A query reads from the updated state, and a sigmoid output gate modulates what moves onward. The model uses 16 query/key heads and 48 value heads of width 128. Many positions contribute to a fixed-size state. Decode advances that state incrementally, while chunkwise prefill methods process blocks efficiently. [Gated DeltaNet paper](https://arxiv.org/abs/2412.06464) · [Qwen's GDN design](https://arxiv.org/html/2608.30320v1#S2.SS1.SSS1) · [Engine geometry][engine]
+
+**Qwen Sparse Attention (QSA)** occupies every fourth layer. In ordinary attention a token's query scores visible keys, the scores become weights through softmax, and a weighted sum of the values brings information back. Flash Next uses 24 query heads sharing two KV heads of width 256. Rotary position embeddings act on 64 dimensions to give the match information about relative position. A causal mask prevents a position from reading future text. When the whole prompt fits within the 2,048-token budget, Hibana can run ordinary dense causal attention. [Checkpoint dimensions][cfg] · [Hibana attention path][qsa]
+
+Farther into a document, QSA's cheaper indexer groups history into four-token micro-blocks. It compares queries to compressed block keys, chooses up to 512 completed blocks, and includes the current visible partial block. The main attention then reads the selected token positions. At position 32,000 a block containing the original shelf entry near position 100 can still be selected. The budget limits how much value information the expensive stage reads on this pass. It still needs the retained history available for different selections on the next pass. During continued pretraining Qwen replaced periodic full-attention layers with QSA and trained the indexer. A running Spark performs its learned selections without updating that indexer. [Qwen's QSA design and training](https://arxiv.org/html/2608.30320v1#S2.SS1.SSS2) · [Hibana's sparse path][qsa]
+
+### Which experts run and how the model chooses a token
+
+Each of the 48 layers follows its sequence mixer with a **mixture of experts** (MoE). A router scores 512 candidate feed-forward networks from the current vector. The normal model selects ten, weights their results, and adds a sigmoid-gated shared expert that runs for every token. An expert projects the incoming vector into two branches of width 640, applies a nonlinear gate to one and multiplies it by the other, then projects the result back to width 2,560. These operations transform features at one position. The sequence mixer has already brought in context from other positions. A single token makes 480 routed selections over the 48 layers. The ten selected in layer one refer to a different weight bank from the ten in layer two. [Model specifications][card] · [Hibana's routed and shared experts][moe]
+
+A global mixer reads the final four branches and an output matrix computes one **logit**, or unnormalized next-token score, for every vocabulary row. Greedy generation chooses the largest score. In the measured prose requests, temperature 0.7 sharpened the distribution, top-k 20 kept up to twenty candidates, and top-p 1 imposed no extra probability-mass cutoff. A sampled token joins the context and the tokenizer renders the accumulating IDs as text. The one-layer **multi-token prediction** module (MTP) can use recent hidden features plus a new token embedding to propose the next ID cheaply, then iterate. A target pass verifies a block together. Keeping two acceptable guesses can advance the sequence by several positions per expensive pass. A failed proposal requires a correction and a return to the committed history. [Model forward and head][forward] · [Training with multi-token prediction](https://arxiv.org/abs/2404.19737) · [Hibana's MTP implementation][mtp]
 
 ## How this recipe runs it on one DGX Spark
 
-### Build, weights and request path
+### Build the engine and serve the checkpoint
 
-The launcher builds Hibana 0.1.0 at `d474b74` in an ARM64 CUDA container. It stages the RadixArk base checkpoint with NVFP4 routed experts and an FP8 n-gram table. Fast also stages a separately calibrated W3 overlay. NVFP4 uses 4-bit values grouped with higher precision scales, so its packed size also includes the scales. The Docker image provides the build tools and locked Python dependencies. Serving mounts the weight cache read-only, uses offline Hub mode, and binds the API to `127.0.0.1:18904`. [Dockerfile](../Dockerfile) · [Launcher](../bin/recipe.sh) · [Pinned RadixArk checkpoint](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/tree/7b719225242aacd3dbd3f9407468c2ee9a9d2594) · [Pinned W3 overlay](https://huggingface.co/yemara/Qwen3.8-Flash-Next-NVFP4-sharar-w3-qad/tree/5c4c62a62853caebea8cedda7fbed952efa1effe) · [NVIDIA's NVFP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/)
-
-```text
-Spark client → localhost chat API → tokenization and scheduler
-                                          ↓
-                  chunked prefill → KV pages and recurrent state slots
-                                          ↓
-                 MTP proposals → GB10 target verification → stream
-                      ↑                ↑
-       mmap-backed n-gram rows     resident model weights
+```bash
+./bin/recipe.sh build
+./bin/recipe.sh fetch fast
+./bin/recipe.sh serve fast
+# In another terminal on the Spark
+./bin/recipe.sh smoke fast
 ```
 
-The Grace CPU and Blackwell GPU share the Spark's advertised 128 GB of physical memory. On the pinned engine's single-GPU path, the n-gram table is memory mapped from the checkpoint. Hibana gathers the rows it needs and prefetches for later prompt chunks. The OS can keep frequently touched rows in the page cache. The SSD tier for **saved inference cache blocks** is disabled by the recipe, while the checkpoint files still live on storage. [DGX Spark specifications](https://www.nvidia.com/en-us/products/workstations/dgx-spark/#specifications) · [Pinned PLE implementation](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/model/flashnext/ple.py) · [Hibana operations](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/operations.md#serving-profiles) · [Recipe launcher](../bin/recipe.sh)
+The Dockerfile builds Hibana 0.1.0 at `d474b74` for ARM64 with CUDA and locked Python dependencies. The RadixArk base checkpoint holds NVFP4 routed experts and an FP8 n-gram table. Fast additionally stages a calibrated three-bit (W3) overlay. Disk usage is about 126 GiB for the base plus 47 GiB for W3, apart from the build and kernel caches. For Exact, use `fetch exact`, `serve exact` and `smoke exact`. Both profiles mount the weights read-only and use offline Hub mode. The smoke check confirms the active profile, lists the model and checks a response from the local API at `127.0.0.1:18904`. Chat requests use the served ID `RadixArk/Qwen3.8-Flash-Next-NVFP4`. [Setup](setup.md) · [Dockerfile](../Dockerfile) · [Launcher](../bin/recipe.sh) · [Base snapshot][target] · [W3 snapshot][w3]
 
-The API hands ready requests to the scheduler. For decode and verify, Hibana can replay captured CUDA graphs for supported batch shapes, reducing CPU kernel-launch overhead. Its sparse path scores and assembles the selected KV pages on the device inside the graph. The retained KV pages also carry the indexer data used by QSA. For a cached prefix, the runtime needs both the matching attention pages and the recurrent snapshot from which it can continue. [Hibana architecture](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/architecture.md) · [QSA graphs](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#sparse-attention-past-2048-tokens) · [Prefix-cache design](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/cache_design.md)
+```text
+localhost chat API → template and tokenizer → scheduler
+     prefill → read n-gram rows → run target chunks → KV pages + GDN state
+     decode  → MTP proposals → target verifies → commit accepted prefix + correction/bonus
+                            ↖ next round begins at committed state
+```
 
-### What Exact and Fast change
+The Grace CPU and Blackwell GPU share 128 GB of physical memory. On one Spark, the n-gram table is memory mapped from checkpoint shards. Hibana gathers the requested rows and can prefetch later prompt rows while the first chunk runs. The OS file cache can retain frequently used pages. This avoids a permanent GPU allocation for the whole table while making storage access and cache warmth relevant to latency. The recipe disables Hibana's SSD tier for *saved inference-cache blocks*. The mapped weights still reside on storage. [DGX Spark specifications][spark] · [PLE implementation][ple] · [Hibana operations][ops]
 
-| Knob | Exact | Fast |
+**Prefill** processes the known input positions, creates KV entries and advances the GDN states. The recorded engine used FlashInfer attention, CuTe GDN, 4,096-token prefill chunks and a solo chunk limit of 8,192. **Decode** and target verification reuse that history. Captured CUDA graphs replay supported batches of operations, avoiding repeated CPU dispatch for each GPU kernel. For long contexts the graph scores and assembles selected attention pages on the GPU. KV pages also retain the QSA index data. Resuming a reused prefix needs the matching recurrent snapshot as well as those pages. [Engine architecture][arch] · [QSA graphs][qsa] · [Prefix cache][cache] · [FlashInfer paper](https://arxiv.org/abs/2501.01005)
+
+### Exact and Fast change different parts of a forward pass
+
+| Setting | Exact | Fast |
 |---|---|---|
-| Routed expert weights | Base NVFP4 | Calibrated W3 expert weights |
-| Model trunk | FP8 at load | FP8 plus calibrated W3 copies for eligible small decode and verify calls |
+| Routed expert weights | Base NVFP4 | Calibrated W3 |
+| Trunk projections | FP8 at load | FP8 plus W3 copies for eligible small decode and verify calls |
 | Attention KV pool | FP8 | NVFP4 |
-| MTP draft depth | Fixed cap of 4 | Up to 8, with per-batch caps and a recent-acceptance policy |
+| MTP depth | Cap of 4 | Up to 8 with batch caps and recent-acceptance adaptation |
 | Greedy verification | Target top-1 | Target top-3 within a 2-logit gap |
 | Sampled verification | `accept_soft=0` | `accept_soft=0.5` |
-| Expert selection during decode and verify | Normal model routing | Budget on distinct experts read in the forward pass |
-| QSA prefill backend | Original | Optimized path where eligible |
+| Expert selection during decode and verify | Normal routing | Budget on distinct expert weights read per forward pass |
+| QSA prefill | Original backend | Optimized backend where eligible |
 
-The settings come from the pinned [profile implementation](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/launch/settings.py) and the [Exact](../results/exact.server.json) and [Fast](../results/fast.server.json) runtime records. The W3 **weight** format changes expert and projection reads. The NVFP4 **KV** format compresses attention history. The recurrent GDN state uses FP32 in both profiles. [Hibana W3 calibration](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/w3-calibration.md) · [Operations and fallback rules](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/operations.md#serving-profiles)
+Quantization stores approximations to the original numbers. NVFP4 packs four-bit values with block scales. The W3 overlay uses calibrated three-bit copies to reduce bytes read when running experts and eligible projections. The attention KV format determines how many bytes record the history of a conversation. Both profiles keep FP32 GDN state. In this release the raw server information's top-level KV dtype stays FP8 even for Fast. Read `config.kv_format` to see the effective cache format. [Exact settings](../results/exact.server.json) · [Fast settings](../results/fast.server.json) · [Pinned profiles][profiles] · [W3 calibration][cal] · [NVIDIA's NVFP4 format][nvfp4]
 
-With standard speculative sampling, a proposed token with draft probability **q** and target probability **p** is kept with probability **min(1, p/q)**, followed by a correction draw when rejected. Hibana's positive soft margin increases the acceptance threshold in Fast. Exact refers to verification against the model as served with its configured weights and numerics. Fast also changes weights and expert selection, so a profile comparison measures the combined effect of those choices. In our small text probe, Exact matched five of five Chinese answers and Fast matched three of five. See the coding results for a separate task-level comparison. [Speculative decoding paper](https://arxiv.org/abs/2211.17192) · [Hibana acceptance rules](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/operations.md#serving-profiles) · [Quality probes](../README.md#traditional-chinese-and-tool-calls) · [Coding benchmark](../README.md#multi-file-coding-benchmark)
+In standard speculative sampling, a token that has probability *q* under the draft and *p* under the target is kept with probability `min(1, p/q)`. At the first rejection the engine uses a correction draw. If every candidate passes, it can draw a bonus token. Exact applies this test against the target as actually served with quantized weights. Fast's positive soft margin also accepts proposals under a relaxed test, and Fast changes weight precision and expert selection. These differences can affect the answer. In five Traditional Chinese probes Exact matched 5/5 and Fast 3/5, including a wording variant and a clock error. Both passed 3/4 tool checks. On one coding task Exact passed 10/10 independent feature checks and Fast 7/10. [Speculative sampling paper](https://arxiv.org/abs/2211.17192) · [Engine acceptance rules][ops] · [Chinese and tool checks](../README.md#traditional-chinese-and-tool-calls) · [Coding task](../README.md#multi-file-coding-benchmark)
 
-### Memory, scheduling and observed performance
+### Read the memory ledger and the benchmark
 
-Prefill processes input in chunks and writes both the attention KV and recurrent state. Decode and target verification reuse those structures. Hibana allocates a shared one-token-page KV pool and a pool of state slots, including reusable prefix snapshots. The measured runtime reported FlashInfer attention, CuTe GDN, and prefill chunks of 4,096 tokens with a solo limit of 8,192. The launcher sets five active requests, a 262,144-token prompt-plus-output limit per request, and a 12 GiB host memory floor. The floor is host headroom used in planning, while the KV and state allocations depend on memory available at startup. [Hibana cache design](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/cache_design.md) · [Memory planner](https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/memory_plan.md) · [FlashInfer paper](https://arxiv.org/abs/2501.01005)
-
-| Startup ledger on our Spark | Exact | Fast |
+| Recorded startup allocation | Exact | Fast |
 |---|---:|---:|
 | Weights | 68.89 GiB | 53.03 GiB |
 | Attention KV pool | 9.36 GiB | 22.54 GiB |
-| KV pages | 545,364 | 1,853,962 |
+| One-token KV pages | 545,364 | 1,853,962 |
 | Recurrent state pool | 9.26 GiB | 12.06 GiB |
+| Proposer and verification buffers | 4.10 GiB | 6.65 GiB |
+| CUDA graphs | 0.77 GiB | 2.80 GiB |
 
-As a capacity check, five requests at the full configured limit would ask for 1,310,720 token positions before any scheduler and verification overhead. The Exact run's recorded pool is smaller than that total. The Fast run's recorded pool is larger, and admission still depends on live memory and state availability. Our five-request measurements used short prompts. The larger Fast KV pool and extra buffers help explain why lower weight memory coexisted with higher total CUDA allocation in that session. The **101.2 GiB** figure is a sampled process peak from a separate Fast run, with startup, decode and prefill included. [Exact memory ledger](../results/exact.server.json) · [Fast memory ledger](../results/fast.server.json) · [Fast memory samples](../results/fast.memory.json)
+The launcher allows five active requests, a limit of 262,144 prompt-plus-output tokens per request and a 12 GiB host memory floor. This floor preserves host headroom when the planner sizes its pools. Five full-length requests would require 1,310,720 token positions before scheduler and verification overhead. The Exact ledger has fewer pages than that. Fast has more, but admission still depends on live memory and state slots. The five-stream tests used short prompts. Saving weight memory allowed Fast to allocate more history and verification space. Its **101.2 GiB sampled process peak** came from a separate run covering startup, one through five decode streams and 32K/200K prefill. [Memory planner][planner] · [Exact ledger](../results/exact.server.json) · [Fast ledger](../results/fast.server.json) · [Memory series](../results/fast.memory.json)
 
-In the recorded thinking-on prose workload, Exact reached **50.8 tok/s** and Fast reached **101.7 tok/s** at one stream. At five streams the corresponding aggregate rates were **116.6** and **213.8 tok/s**. Draft acceptance, fewer weight bytes and fewer distinct expert reads can all improve decode. This comparison changes those settings together, so it measures the whole profile. The fresh-prompt prefill tests report a different rate using input tokens divided by time to the first token. [Decode methodology](benchmarking.md#workload) · [Exact decode](../results/exact.decode.json) · [Fast decode](../results/fast.decode.json) · [Fast prefill](../results/fast.prefill-32k-128k.json)
+The November 21 prose test requested 400 generated tokens per stream with thinking on. At one stream the best of three waves reached **50.8 output tok/s for Exact and 101.7 for Fast**. At five streams the aggregate rates were **116.6 and 213.8 tok/s**, respectively. These figures compare complete serving profiles, with multiple simultaneous changes. The separate Fast prefill experiment used fresh prompts, temperature zero, thinking off and verified zero cached tokens. Across three samples per size, median time to first token was **8.64 s at 32K** and **37.07 s at 128K**, or **3,796 and 3,536 input tok/s**. All six returned the expected code. The earlier single 199,981-token prompt also returned its key. A retrieval success tells us what happened to that prompt, while the memory ledger explains which additional requests could compete for the same pools. [Method](benchmarking.md#workload) · [Exact decode](../results/exact.decode.json) · [Fast decode](../results/fast.decode.json) · [32K/128K samples](../results/fast.prefill-32k-128k.json) · [Earlier 200K sample](../results/fast.prefill.json)
+
+[card]: https://huggingface.co/Qwen/Qwen3.8-Flash-Next#model-overview
+[report]: https://arxiv.org/html/2608.30320v1#S2
+[cfg]: https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/blob/7b719225242aacd3dbd3f9407468c2ee9a9d2594/config.json
+[target]: https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4/tree/7b719225242aacd3dbd3f9407468c2ee9a9d2594
+[w3]: https://huggingface.co/yemara/Qwen3.8-Flash-Next-NVFP4-sharar-w3-qad/tree/5c4c62a62853caebea8cedda7fbed952efa1effe
+[spark]: https://www.nvidia.com/en-us/products/workstations/dgx-spark/#specifications
+[nvfp4]: https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+[engine]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#the-model-as-served
+[mixer]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/model/flashnext/hyper.py
+[ple]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/model/flashnext/ple.py
+[qsa]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#sparse-attention-past-2048-tokens
+[moe]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/model/flashnext/moe.py
+[forward]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/model/flashnext/model.py
+[mtp]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/flashnext.md#the-mtp-draft
+[ops]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/operations.md#serving-profiles
+[arch]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/architecture.md
+[cache]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/cache_design.md
+[cal]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/w3-calibration.md
+[profiles]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/hibana/launch/settings.py
+[planner]: https://github.com/sharar-project/hibana/blob/d474b74d5a892b2cd1cc8fc50cb17946e2a539bb/docs/memory_plan.md
