@@ -1,5 +1,19 @@
 # Benchmark methodology
 
+## Run the benchmarks
+
+Follow the [quick start](../README.md#quick-start) for the profile you want to measure. In a second Spark terminal from the checkout, run the following after the smoke check has passed. Set `profile=fast` for the Fast run.
+
+```bash
+export SPARK_BENCHMARK_URL=http://127.0.0.1:18904
+export SPARK_BENCHMARK_MODEL=RadixArk/Qwen3.8-Flash-Next-NVFP4
+profile=exact
+mkdir -p runs
+curl --noproxy '*' -fsS "$SPARK_BENCHMARK_URL/get_server_info" >"runs/$profile.server.json" &&
+python3 bin/benchmark.py >"runs/$profile.decode.json" &&
+python3 bin/checks.py >"runs/$profile.checks.json"
+```
+
 ## Workload
 
 The direct `/v1/chat/completions` client uses the [SparkDash hash-map prompt](https://github.com/MiaAI-Lab/sparkDash/blob/91a3e46d7cbadf6daf4d53b5e7ae34e519f353ca/src/shared/llmPrompts.js#L53-L56). At concurrency two and above it prefixes each request with its own `Request ID: decode-N`. The client runs a short chat smoke check, then a 32-token warm-up on the prose prompt. It sends three synchronized waves at each concurrency from one through five.
@@ -29,7 +43,7 @@ For KV format, read `config.kv_format` in the raw Hibana runtime record. The top
 
 ## Cold prefill and process memory
 
-With only the dedicated Hibana benchmark server running and the URL and model variables from the README exported, run:
+With only the dedicated Hibana benchmark server running and the URL and model variables from the commands above exported, run the prefill client.
 
 ```bash
 python3 bin/prefill.py runs/fast.prefill-32k-128k.json

@@ -4,6 +4,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy UV_NO_CACHE=1 CUDA_HOME=/usr/local/cuda
 WORKDIR /opt/hibana
 COPY . .
-RUN test "$(git rev-parse HEAD)" = d474b74d5a892b2cd1cc8fc50cb17946e2a539bb && uv sync --frozen
+RUN chmod -R a+rX /opt/hibana \
+    && test "$(git rev-parse HEAD)" = d474b74d5a892b2cd1cc8fc50cb17946e2a539bb \
+    && uv sync --frozen
 ENV PATH=/opt/hibana/.venv/bin:/usr/local/cuda/bin:$PATH
-RUN hibana --help >/dev/null
+USER 65534:65534
+RUN HOME=/tmp hibana --help >/dev/null
+USER root

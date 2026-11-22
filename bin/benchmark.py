@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Measure single- and multi-stream prose decode on a localhost API."""
+import argparse
 import concurrent.futures
 import hashlib
 import json
@@ -122,7 +123,7 @@ def decode_wave(streams, repetition):
             "aggregate_decode_tokens_per_second": (tokens - streams) / decode_seconds,
             "aggregate_wall_tokens_per_second": tokens / elapsed_seconds}
 
-def main():
+def chat_smoke():
     if MODEL not in [item["id"] for item in api("/v1/models")["data"]]:
         raise RuntimeError("Wrong model on localhost.")
     sanity, _, answer = stream("Reply with exactly the word READY.", thinking=False,
@@ -130,6 +131,24 @@ def main():
     if answer.strip().upper().rstrip(".") != "READY":
         raise RuntimeError("Basic chat smoke failed.")
     print(f"Chat smoke passed ({sanity['completion_tokens']} output tokens).", file=sys.stderr, flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke", choices=("exact", "fast"), help="check the profile and one chat reply")
+    args = parser.parse_args()
+    if args.smoke:
+        server = api("/get_server_info")
+        config = server.get("config") or {}
+        expected = ("fp8", 0.0, False) if args.smoke == "exact" else ("nvfp4", 0.5, True)
+        actual = (config.get("kv_format"), config.get("accept_soft"), bool(server.get("w3_target_identity")))
+        if (server.get("engine") != "hibana" or server.get("target") != "flashnext"
+                or config.get("profile") != args.smoke or actual != expected):
+            parser.exit(1, f"Local server does not match the requested Hibana {args.smoke} profile.\n")
+        print(f"Hibana {args.smoke} profile verified (KV {actual[0]}, accept_soft {actual[1]}).", flush=True)
+    chat_smoke()
+    if args.smoke:
+        return
     stream(HASH_MAP_PROMPT, thinking=True, limit=32, temperature=0.7)
     waves = []
     errors = []

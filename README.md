@@ -2,6 +2,49 @@
 
 Single-stream prose decode with thinking on reached **101.7 tok/s** with Hibana `fast` and **56.0 tok/s** in the published TensorFold run. Hibana `fast` reached **220.9 tok/s aggregate at four streams** and **213.8 tok/s at five**. This recipe reproduces the serving configuration for both Hibana profiles and includes the matched TensorFold control, Traditional Chinese prompts, and OpenAI tool-call checks.
 
+[Quick start](#quick-start) · [Setup](docs/setup.md) · [How it works](docs/how-it-works.md) · [Troubleshooting](docs/troubleshooting.md) · [Exact and fast](#exact-and-fast) · [Results and raw data](docs/benchmarking.md)
+
+## Quick start
+
+Run the commands **on one DGX Spark**. You need Linux ARM64, a working Docker GPU setup, Git, Bash, Python 3, and curl. The base weights use about **126 GiB** and the optional W3 weights use about **47 GiB**. Allow room for the build and CUDA caches too. [Host checklist and storage details](docs/setup.md#before-you-start)
+
+```bash
+git clone https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-hibana.git &&
+cd qwen38-flash-next-single-dgx-spark-hibana &&
+./bin/recipe.sh build &&
+./bin/recipe.sh fetch fast
+```
+
+`fetch fast` stages both checkpoints. Use `fetch exact` when you only want the base weights. You can build and download while another model serves. Before starting Hibana, pause other GPU inference workloads you control.
+
+```bash
+./bin/recipe.sh serve exact
+```
+
+Keep that terminal open while the weights load and kernels compile. Once it announces `http://127.0.0.1:18904`, run the smoke check in a second Spark terminal from the same checkout.
+
+```bash
+./bin/recipe.sh smoke exact
+```
+
+The check verifies the active profile, lists the model, and waits for the model to reply `READY`. Use `http://127.0.0.1:18904/v1` and model ID `RadixArk/Qwen3.8-Flash-Next-NVFP4` in an OpenAI-compatible client. [Send your own prompt](docs/setup.md#send-a-chat-request)
+
+Stop exact from the second terminal, or press Ctrl-C in the serving terminal.
+
+```bash
+./bin/recipe.sh stop
+```
+
+Then start fast.
+
+```bash
+./bin/recipe.sh serve fast
+```
+
+After fast is ready, run `./bin/recipe.sh smoke fast` in the second terminal. Use `./bin/recipe.sh logs` while a test container exists. When finished, stop Hibana and restart the inference service you paused.
+
+Both profiles passed the November 22, 2026 clean-install chat check on one DGX Spark. [Verification details](docs/setup.md#clean-install-check)
+
 ![Qwen3.8 Flash Next on Hibana fast. Decode 101.7 tok/s at one stream and 213.8 at five. Cold prefill 3,796 tok/s at 32K and 3,536 at 128K. Peak sampled GPU memory 101.2 GiB.](assets/hibana-fast-101-7.png)
 
 ## Performance on one DGX Spark
@@ -80,42 +123,6 @@ All three ran sequentially on loopback with thinking on, temperature zero and th
 The untouched 13-test suite was also replayed against each patch. TensorFold passed 12, Hibana `exact` passed 11, and Hibana `fast` passed 13. The failures were mock callbacks that rejected the new `thinking` keyword.
 
 The preceding 16,384-token run used the same harness without a per-response cap. All three exhausted that budget. The 32,768-token rerun is one attempt per serving profile on this task.
-
-## Run it
-
-Use a DGX Spark with Docker, NVIDIA GPU container support, Git, Bash, curl, and Python 3. This run used NVIDIA driver `580.178.04`. Checkpoint downloads total about **126 GiB** for `exact`, plus **47 GiB** for `fast`. Allow additional space for the image and CUDA kernel caches.
-
-On the Spark:
-
-```bash
-git clone https://github.com/outsmartchad/qwen38-flash-next-single-dgx-spark-hibana.git
-cd qwen38-flash-next-single-dgx-spark-hibana
-./bin/recipe.sh build
-./bin/recipe.sh fetch fast
-```
-
-`fetch fast` stages both checkpoints. Use `fetch exact` to download only the base checkpoint. The build and fetch steps can run while the existing model serves. Pause other inference workloads before serving and measuring either Hibana profile.
-
-```bash
-./bin/recipe.sh serve exact
-```
-
-Wait for the process to announce `http://127.0.0.1:18904`. In a second Spark shell from the checkout:
-
-```bash
-export SPARK_BENCHMARK_URL=http://127.0.0.1:18904
-export SPARK_BENCHMARK_MODEL="$(
-  curl --noproxy '*' -fsS "$SPARK_BENCHMARK_URL/v1/models" |
-    python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["id"])'
-)"
-profile=exact
-mkdir -p runs
-curl --noproxy '*' -fsS "$SPARK_BENCHMARK_URL/get_server_info" > "runs/$profile.server.json"
-python3 bin/benchmark.py > "runs/$profile.decode.json"
-python3 bin/checks.py > "runs/$profile.checks.json"
-```
-
-Stop the foreground process with Ctrl-C. Start `./bin/recipe.sh serve fast` and repeat the second-shell commands with `profile=fast`. Stop Hibana after testing and restart your original inference service. The recipe binds Hibana to loopback and keeps the original service under your control. `SPARK_HIBANA_CACHE` accepts an absolute path for checkpoints, the upstream checkout, and kernel files.
 
 ## Upstream and license
 

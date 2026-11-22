@@ -11,13 +11,26 @@ upstream="$cache/upstream"
 revision=d474b74d5a892b2cd1cc8fc50cb17946e2a539bb
 image=spark-bench-hibana:d474b74
 port=18904
+container_name=qwen38-hibana-flash-next
+container_label=io.github.outsmartchad.hibana-recipe=1
 
 usage() {
-    printf 'Usage: %s build | fetch {exact|fast} | serve {exact|fast}\n' "$0" >&2
+    printf 'Usage: %s build | fetch {exact|fast} | serve {exact|fast} | smoke {exact|fast} | logs | stop\n' "$0" >&2
     exit 2
 }
 
+require_image() {
+    if ! docker image inspect "$image" >/dev/null; then
+        printf '%s\n' 'Cannot access the Hibana image. Check Docker access and run ./bin/recipe.sh build.' >&2
+        exit 1
+    fi
+}
+
 snapshot_path() {
+    if [[ ! -s "$cache/$1.json" ]]; then
+        printf 'Missing %s checkpoint marker. Run ./bin/recipe.sh fetch %s.\n' "$1" "$profile" >&2
+        return 1
+    fi
     python3 - "$cache/$1.json" "$2" <<'PY'
 import json
 import sys
@@ -51,6 +64,7 @@ case "${1:-}" in
         ;;
     fetch)
         [[ $# == 2 && ( "$2" == exact || "$2" == fast ) ]] || usage
+        require_image
         mkdir -p "$cache/hf"
         docker run --rm --cap-drop ALL --security-opt no-new-privileges \
             --user "$(id -u):$(id -g)" --env HOME=/cache --env HF_HOME=/cache/hf \
@@ -62,12 +76,19 @@ case "${1:-}" in
     serve)
         [[ $# == 2 && ( "$2" == exact || "$2" == fast ) ]] || usage
         profile="$2"
+        require_image
         target="$(snapshot_path target 7b719225242aacd3dbd3f9407468c2ee9a9d2594)"
-        test -f "$cache/hf/$target/config.json"
+        if [[ ! -s "$cache/hf/$target/config.json" ]]; then
+            printf 'Base checkpoint is incomplete. Run ./bin/recipe.sh fetch %s.\n' "$profile" >&2
+            exit 1
+        fi
         profile_env=(-e HIBANA_SSD=0)
         if [[ "$profile" == fast ]]; then
             w3="$(snapshot_path w3 5c4c62a62853caebea8cedda7fbed952efa1effe)"
-            test -f "$cache/hf/$w3/manifest.json"
+            if [[ ! -s "$cache/hf/$w3/manifest.json" ]]; then
+                printf '%s\n' 'W3 checkpoint is incomplete. Run ./bin/recipe.sh fetch fast.' >&2
+                exit 1
+            fi
             profile_env+=(-e "HIBANA_W3_CHECKPOINT=/hf/$w3")
         fi
         state="$cache/state/$profile"
@@ -77,7 +98,8 @@ case "${1:-}" in
             printf '%s\n' 'The benchmark config file must be empty.' >&2
             exit 1
         fi
-        exec docker run --rm --name qwen38-hibana-flash-next --gpus all --network host --shm-size=2g \
+        exec docker run --rm --name "$container_name" --label "$container_label" \
+            --gpus all --network host --shm-size=2g \
             --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
             --ulimit memlock=-1 --ulimit stack=67108864 \
             -e HOME=/state -e USER=benchmark -e LOGNAME=benchmark -e XDG_CACHE_HOME=/kernels \
@@ -88,6 +110,24 @@ case "${1:-}" in
             "${profile_env[@]}" -v "$cache/hf:/hf:ro" -v "$cache/kernels:/kernels:rw" \
             -v "$state:/state:rw" "$image" hibana serve flashnext "--$profile" --no-fetch \
             --host 127.0.0.1 --port "$port" --max-batch 5 --context-length 262144
+        ;;
+    smoke)
+        [[ $# == 2 && ( "$2" == exact || "$2" == fast ) ]] || usage
+        export SPARK_BENCHMARK_URL="http://127.0.0.1:$port"
+        export SPARK_BENCHMARK_MODEL=RadixArk/Qwen3.8-Flash-Next-NVFP4
+        exec python3 "$root/bin/benchmark.py" --smoke "$2"
+        ;;
+    logs|stop)
+        [[ $# == 1 ]] || usage
+        owned="$(docker ps -aq --no-trunc --filter "name=^/$container_name$" --filter "label=$container_label")"
+        if [[ -z "$owned" ]]; then
+            printf '%s\n' 'No container started by this recipe is present. See the serve terminal.' >&2
+            exit 1
+        fi
+        if [[ "$1" == logs ]]; then
+            exec docker logs --tail 100 "$owned"
+        fi
+        exec docker stop "$owned"
         ;;
     *) usage ;;
 esac
